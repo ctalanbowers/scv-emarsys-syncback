@@ -1,0 +1,4 @@
+cfn-lint
+pylint
+boto3
+awscli
