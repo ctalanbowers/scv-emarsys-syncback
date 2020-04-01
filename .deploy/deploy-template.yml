@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CT Lambda Stack
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: SSM Parameter Keys (dont change these)
+        Parameters:
+          - Environment
+
+Parameters:
+  Environment:
+    # Pulling SSM parameter as a CFN parameter, because SSM parameter dynamic references cannot specify latest version
+    # See https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/dynamic-references.html#dynamic-references-ssm
+    Type: AWS::SSM::Parameter::Value<String>
+    Description: SSM parameter key for the environment value
+    Default: Environment
+  ProjectName:
+    Type: String
+    Description: The project name to be used (defaults to stack name)
+    AllowedPattern: ^([a-z]+([a-z\-]*[a-z]+)*)$
+    ConstraintDescription: Lowercase letters and hyphens only, not starting or ending with a hyphen
+  RequireDatabaseAccess:
+    Type: String
+    Description: Whether the lambda function requires access to the CT database
+    AllowedValues: [true, false]
+    ConstraintDescription: Must be either true or false
+    Default: false
+  LambdaHandler:
+    Description: The handler of the lambda function - qualified reference to the entry point method
+    Type: String
+    AllowedPattern: ^(com\.charlottetilbury\.)([a-z]+\.)+([A-Z]+[A-Za-z]+)::[a-z]+[A-Za-z]*$
+    ConstraintDescription: Has to match 'com.charlottetilbury.your.packages.Class::methodName'
+  LambdaTimeout:
+    Description: Timeout for the lambda function
+    Type: Number
+    MinValue: 1
+    MaxValue: 900
+    Default: 30
+  LambdaDescription:
+    Description: Description of the lambda function
+    Type: String
+  LambdaMemorySize:
+    Description: The amount of memory that the lambda function will have access to (in MB, in multiples of 64)
+    Type: Number
+    MinValue: 128
+    MaxValue: 3008
+    Default: 256
+  LambdaConcurrencyLimit:
+    Description: The number of invocations of this lambda function that can run concurrently
+    Type: Number
+    MinValue: 0
+    MaxValue: 1000
+    Default: 1
+  ScheduleRate:
+    Description: In minutes, the frequency with which the lambda function should be triggered
+    Type: Number
+    Default: 0
+  S3Bucket:
+    Description: S3 Bucket containing the artefacts
+    Type: String
+  S3ObjectVersion:
+    Description: The version of the artecfact to be deployed in s3
+    Type: String
+
+Conditions:
+  ProvideDatabaseAccess: !Equals [!Ref RequireDatabaseAccess, true]
+  Scheduled: !Not [!Equals [!Ref ScheduleRate, 0]]
+
+Resources:
+  LambdaServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal:
+            Service:
+              - lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - !Ref LambdaParameterSecretAccessPolicy
+
+  LambdaParameterSecretAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}-*"
+          - Effect: Allow
+            Action: ssm:GetParameters
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+          - Effect: Allow
+            Action: ssm:GetParameter
+            Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*"
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Egress rules from Lambda out
+      VpcId: !ImportValue VPCBase
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaRDSIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: ProvideDatabaseAccess
+    Properties:
+      Description: !Sub Security ingress for ${ProjectName} lambda to RDS
+      GroupId: !ImportValue RDSSecurityGroup
+      SourceSecurityGroupId: !GetAtt LambdaSecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Sub ${ProjectName}.jar
+        S3ObjectVersion: !Ref S3ObjectVersion
+      Description: !Ref LambdaDescription
+      FunctionName: !Ref ProjectName
+      Handler: !Ref LambdaHandler
+      MemorySize: !Ref LambdaMemorySize
+      ReservedConcurrentExecutions: !Ref LambdaConcurrencyLimit
+      Role: !GetAtt LambdaServiceRole.Arn
+      Runtime: java11
+      Timeout: !Ref LambdaTimeout
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue PrivateNetAZ1
+          - !ImportValue PrivateNetAZ2
+        SecurityGroupIds:
+          - !GetAtt LambdaSecurityGroup.GroupId
+
+  ScheduledLambdaInvocationRule:
+    Type: AWS::Events::Rule
+    Condition: Scheduled
+    Properties:
+      Description: "ScheduledRule"
+      ScheduleExpression: !Sub "rate(${ScheduleRate} minutes)"
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt LambdaFunction.Arn
+          Id: LambdaScheduleEvent
+
+  ScheduledLambdaInvokationPermission:
+    Type: AWS::Lambda::Permission
+    Condition: Scheduled
+    Properties:
+      FunctionName:
+        Ref: "LambdaFunction"
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt ScheduledLambdaInvocationRule.Arn
+
+Outputs:
+  LambdaIAMRole:
+    Description: The Role of the lambda being deployed
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaIAMRole
+    Value: !GetAtt LambdaServiceRole.Arn
+  LambdaIAMRoleName:
+    Description: The name of the role for the lambda
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaIAMRoleName
+    Value: !Ref LambdaServiceRole
+  LambdaFunction:
+    Description: The lambda function being deployed
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaFunction
+    Value: !GetAtt LambdaFunction.Arn

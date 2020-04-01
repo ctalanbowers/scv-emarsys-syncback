@@ -1,0 +1,236 @@
+version: 2.1
+
+orbs:
+  dependency_check: entur/owasp@0.0.10
+
+commands:
+  python_setup:
+    description: "Setup environment - checkout repo, restore dependency cache, install dependencies"
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "requirements.txt" }}
+            # fallback to using the latest cache if no exact match is found
+            - v1-dependencies-
+      - run:
+          name: Install dependencies
+          command: |
+            python3 -m venv venv
+            . venv/bin/activate
+            pip install -r requirements.txt
+      - save_cache:
+          paths:
+            - ./venv
+          key: v1-dependencies-{{ checksum "requirements.txt" }}]
+  java_setup:
+    description: "Install Java environment dependencies"
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-java-dependencies-{{ checksum "pom.xml" }}
+            # fallback to using the latest cache if no exact match is found
+            - v1-java-dependencies-
+      - run:
+          name: Install dependencies
+          command: mvn dependency:go-offline -s .circleci/settings.xml
+      - save_cache:
+          paths: [ ~/.m2 ]
+          key: v1-java-dependencies-{{ checksum "pom.xml" }}
+
+
+executors:
+  python_executor:
+    docker:
+      - image: circleci/python:3.7.6
+    working_directory: ~/repo
+    # Requires a CircleCI paid plan to specify
+    # small = 1vCPU, 2GiB RAM
+    #resource_class: small
+  java_executor:
+    docker: [ image: circleci/openjdk:11.0.6-jdk-stretch ]
+    working_directory: ~/repo
+    # Requires a CircleCI paid plan to specify
+    # large = 4vCPU, 8GiB RAM
+    #resource_class: large
+
+jobs:
+  Lint:
+    executor: python_executor
+    steps:
+      - python_setup
+      - run:
+          name: Lint templates
+          command: |
+            . venv/bin/activate
+            cfn-lint  .deploy/deploy-template.yml
+
+  Code analysis:
+    executor: java_executor
+    parameters:
+      sonar_args:
+        type: string
+        default: ""
+    steps:
+      - java_setup
+      - run:
+          name: Sonar
+          command: mvn clean install sonar:sonar -Dsonar.login=$SONAR_TOKEN << parameters.sonar_args >>
+
+  Build:
+    executor: java_executor
+    steps:
+      - java_setup
+      - run:
+          name: Build and run tests
+          command: mvn clean install
+      - persist_to_workspace:
+          root: .
+          paths:
+            - target/${artifactId}.jar
+
+  Copy artefact to s3:
+    executor: python_executor
+    steps:
+      - python_setup
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Copy to S3
+          command: |
+            . venv/bin/activate
+
+            PROJECT_NAME="${artifactId}"
+            S3_BUCKET_NAME="${bucketName}"
+
+            aws s3api put-object \
+              --bucket ${S3_BUCKET_NAME} \
+              --key ${PROJECT_NAME}.jar \
+              --body /tmp/workspace/target/${PROJECT_NAME}.jar \
+              --metadata commit.sha=<< pipeline.git.revision >> \
+              --region eu-west-1 \
+              --query VersionId  \
+              --output text > lambda_version.txt
+
+      - persist_to_workspace:
+          root: .
+          paths:
+            - lambda_version.txt
+
+  Deploy:
+    executor: python_executor
+    steps:
+      - python_setup
+      - attach_workspace:
+          at: /tmp/workspace
+      - run:
+          name: Deploy
+          command: |
+            . venv/bin/activate
+
+            S3_BUCKET_NAME="${bucketName}"
+            PROJECT_NAME="${artifactId}"
+            LAMBDA_DESCRIPTION="${awsLambdaServiceDescription}"
+            REQUIRE_DB_ACCESS="false"
+            LAMBDA_HANDLER="com.charlottetilbury.scv.emarsys.syncback.service.AwsLambdaEntryPointService::handleRequest"
+            LAMBDA_MEMORY_SIZE="512"
+            LAMBDA_TIMEOUT="900"
+            LAMBDA_SCHEDULE_RATE="0"
+            LAMBDA_VERSION=$(cat /tmp/workspace/lambda_version.txt)
+            REGION=eu-west-1
+
+            #export region
+            export AWS_DEFAULT_REGION="$REGION"
+
+            # Deploy any changes to the stack
+            aws cloudformation deploy \
+                --template-file .deploy/deploy-template.yml \
+                --stack-name ${PROJECT_NAME} \
+                --capabilities CAPABILITY_IAM \
+                --no-fail-on-empty-changeset \
+                --parameter-overrides ProjectName=${PROJECT_NAME} \
+                LambdaDescription="${LAMBDA_DESCRIPTION}" \
+                LambdaHandler=${LAMBDA_HANDLER} \
+                LambdaMemorySize=${LAMBDA_MEMORY_SIZE} \
+                RequireDatabaseAccess=${REQUIRE_DB_ACCESS} \
+                LambdaTimeout=${LAMBDA_TIMEOUT} \
+                ScheduleRate=${LAMBDA_SCHEDULE_RATE} \
+                S3Bucket=${S3_BUCKET_NAME} \
+                S3ObjectVersion=${LAMBDA_VERSION}
+
+workflows:
+  version: 2
+
+  Build feature branch:
+    jobs:
+      - Lint:
+          filters:
+            branches:
+              ignore: [ master ]
+          context: build
+      - Code analysis:
+          requires:
+            - "Lint"
+          sonar_args: "-Dsonar.branch.name=<< pipeline.project.git_url >> -Dsonar.branch.target=master"
+          context: build
+      - dependency_check/maven_owasp_dependency_check:
+          requires:
+            - "Lint"
+          executor: java_executor
+          context: build
+          settings_file: .circleci/settings.xml
+      - Build:
+          requires:
+            - "Lint"
+          context: build
+
+  Build and deploy:
+    jobs:
+      - Lint:
+          filters:
+            branches:
+              only: [ master ]
+          context: build
+      - Code analysis:
+          requires:
+            - "Lint"
+          sonar_args: ""
+          context: build
+      - Build:
+          requires:
+            - "Lint"
+          context: build
+      - "Copy artefact to s3":
+          requires:
+            - "Build"
+          context: tools
+      - Deploy:
+          requires:
+            - "Copy artefact to s3"
+          name: Deploy to dev
+          context: dev
+      - "QA: Trigger deployment":
+          type: approval
+          requires: [ "Deploy to dev" ]
+      - Deploy:
+          requires:
+            - "QA: Trigger deployment"
+          name: Deploy to QA
+          context: qa
+      - "Staging: Trigger deployment":
+          type: approval
+          requires: [ "Deploy to QA" ]
+      - Deploy:
+          requires:
+            - "Staging: Trigger deployment"
+          name: Deploy to staging
+          context: staging
+      - "Prod: Trigger deployment":
+          type: approval
+          requires: [ "Deploy to staging" ]
+      - Deploy:
+          requires:
+            - "Prod: Trigger deployment"
+          name: Deploy to prod
+          context: prod
